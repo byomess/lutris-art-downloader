@@ -1,130 +1,296 @@
-# Import necessary modules
-import requests, sqlite3, os, inquirer, base64
+# Refactored and Improved Lutris Cover Art Downloader
 
-# Vars
-user = ''
-dbpath = ''
-dim = ''
-auth = ''
-covpath = ''
+import requests
+import sqlite3
+import os
+import inquirer
 
-# Main function
-def main():
-    global user, dbpath, dim, auth
-    print("Welcome " + user + " to Lutris Cover Art Downloader!\n")
-    user = GetUser()
-    dbpath = '/home/' + user + '/.local/share/lutris/pga.db'
-    dim = GetCoverType()
-    auth = GetAPIKey()
-    print("Getting API Key...\n")
-    if auth == '':
-        SetAPIKey()
-    co = DBConnect()
-    GetGamesList(co)
+# Constants - Define configuration at the top for easy modification
+API_KEY_FILE = './apikey.txt'
+LUTRIS_DB_PATH_TEMPLATE = '/home/{user}/.local/share/lutris/pga.db'
+BANNER_CACHE_PATH_TEMPLATE = '/home/{user}/.cache/lutris/banners/'
+COVERART_CACHE_PATH_TEMPLATE = '/home/{user}/.cache/lutris/coverart/'
+BANNER_DIMENSIONS = '460x215'
+VERTICAL_DIMENSIONS = '600x900'
+STEAMGRIDDB_API_BASE_URL = 'https://www.steamgriddb.com/api/v2'
+COVER_ART_EXTENSIONS = ['.png', '.jpeg', '.jpg'] # Added list of extensions to check
 
 
-####### FUNCTIONS
+def get_username():
+    """
+    Attempts to get the current user's username.
 
-
-def GetUser():
+    Returns:
+        str: The username if successful.
+        None: If the username cannot be retrieved.
+    """
     try:
         return os.getlogin()
-    except:
-        print("Could not get session username")
-        exit(1)
+    except OSError:
+        print("Error: Could not get session username.")
+        return None
 
-def GetCoverType():
-    global covpath
+def get_cover_type():
+    """
+    Prompts the user to choose between Steam banners or vertical covers.
+
+    Returns:
+        tuple: A tuple containing:
+            - str: Dimensions string (e.g., '460x215').
+            - str: Cover cache path.
+    """
     questions = [
-    inquirer.List('type',
-                    message="Would you like to download Steam banners or Steam vertical covers?",
-                    choices=['Banner (460x215)', 'Vertical (600x900)'],
-                ),
+        inquirer.List(
+            'cover_type',
+            message="Select the type of cover art to download:",
+            choices=['Banner', 'Vertical'],
+        ),
     ]
-    ans = inquirer.prompt(questions)["type"]
-    print('Cover type set to ' + ans + '\n')
-    if ans == 'Banner (460x215)':
-        covpath = '/home/' + user + '/.cache/lutris/banners/'
-        dim = '460x215'
-    else:
-        covpath = '/home/' + user + '/.cache/lutris/coverart/'
-        dim = '600x900'
-    return dim
+    answers = inquirer.prompt(questions)
+    if not answers:  # Handle user cancellation (e.g., Ctrl+C)
+        print("Operation cancelled by user.")
+        return None, None
 
-def SaveAPIKey(key):
-    with open('./apikey.txt', 'w') as f:
-        f.write(key)
+    cover_type = answers['cover_type']
+    print(f'Cover type set to {cover_type}\n')
 
-def GetAPIKey():
-    if os.path.isfile('./apikey.txt'):
-        with open('./apikey.txt', 'r') as f:
-            key = f.read()
-            auth = {'Authorization': 'Bearer ' + key}
-            return auth
-    else:
-        return ''
+    if cover_type == 'Banner':
+        dimensions = BANNER_DIMENSIONS
+        cache_path = BANNER_CACHE_PATH_TEMPLATE.format(user=username)
+    else:  # 'Vertical'
+        dimensions = VERTICAL_DIMENSIONS
+        cache_path = COVERART_CACHE_PATH_TEMPLATE.format(user=username)
+    return dimensions, cache_path
 
-def SetAPIKey():
-    print("Could not find API key")
-    print('You need a SteamGriDB API key to use this script.')
-    print('You can get one by using your Steam account and heading here: https://www.steamgriddb.com/profile/preferences/api\n')
-    api = input("Enter your SteamGridDB API key: ")
-    auth = {'Authorization': 'Bearer ' + api}
-    TestAPI(auth, api)
+def save_api_key(api_key):
+    """
+    Saves the SteamGridDB API key to a file.
 
-def TestAPI(key, api):
-    r = requests.get('https://www.steamgriddb.com/api/v2/grids/game/1?dimensions=600x900', headers=key)
-    if r.status_code == 200:
-        print("API key is valid, saving...")
-        SaveAPIKey(api)
-    else:
-        print("API key is invalid")
-        exit(1)
-
-def DBConnect():
+    Args:
+        api_key (str): The API key to save.
+    """
     try:
-        conn = sqlite3.connect(dbpath)
-    except:
-        print("Could not find Lutris database 'pga.db'. You can manually edit script's path if necessary")
-        exit(1)
-    return conn
+        with open(API_KEY_FILE, 'w') as f:
+            f.write(api_key)
+        print("API key saved successfully.")
+    except IOError:
+        print(f"Error: Could not save API key to '{API_KEY_FILE}'.")
 
-# Search for a game by name via Lutris database, then get the grid data
-def SearchGame(game):
-    res = requests.get('https://www.steamgriddb.com/api/v2/search/autocomplete/' + game, headers=auth).json()
-    if len(res["data"]) == 0:
-        print("Could not find a cover for game " + game)
-    else:
-        print("Found game " + game.replace('-', ' ').title())
-        id = res["data"][0]["id"]
-        return id
+def get_api_key_from_file():
+    """
+    Retrieves the SteamGridDB API key from the file.
 
-# Download cover by searching for the game via its name, then via its SteamGriDB's ID
-def DownloadCover(name):
-    gameid = SearchGame(name)
-    print("Downloading cover for " + name.replace('-', ' ').title())
-    grids = requests.get('https://www.steamgriddb.com/api/v2/grids/game/' + str(gameid) + '?dimensions=' + dim, headers=auth).json()
+    Returns:
+        dict: Authorization header dictionary if API key is found, otherwise None.
+    """
+    if os.path.isfile(API_KEY_FILE):
+        try:
+            with open(API_KEY_FILE, 'r') as f:
+                api_key = f.read().strip() # remove leading/trailing whitespaces
+                return {'Authorization': 'Bearer ' + api_key}
+        except IOError:
+            print(f"Warning: Could not read API key from '{API_KEY_FILE}'.")
+            return None
+    return None
+
+def set_api_key():
+    """
+    Prompts the user to enter their SteamGridDB API key and tests its validity.
+
+    Returns:
+        dict: Authorization header dictionary if API key is valid and saved, otherwise None.
+    """
+    print("API key not found.")
+    print('You need a SteamGridDB API key to use this script.')
+    print('You can get one by using your Steam account at: https://www.steamgriddb.com/profile/preferences/api\n')
+    api_key = input("Enter your SteamGridDB API key: ").strip() # remove leading/trailing whitespaces
+    if not api_key: # Handle empty input
+        print("API key cannot be empty. Exiting.")
+        return None
+
+    auth_header = {'Authorization': 'Bearer ' + api_key}
+    if test_api_key(auth_header):
+        save_api_key(api_key)
+        return auth_header
+    return None
+
+def test_api_key(auth_header):
+    """
+    Tests the validity of the SteamGridDB API key by making a request to the API.
+
+    Args:
+        auth_header (dict): Authorization header dictionary.
+
+    Returns:
+        bool: True if the API key is valid, False otherwise.
+    """
+    test_url = f'{STEAMGRIDDB_API_BASE_URL}/grids/game/1?dimensions={VERTICAL_DIMENSIONS}' # Using vertical as default test dimension
     try:
-        url = grids["data"][0]["url"]
-    except:
-        print("Could not find a cover for game " + name)
-        return
-    r = requests.get(url)
-    with open(covpath + name + '.jpg', 'wb') as f:
-        f.write(r.content)
+        response = requests.get(test_url, headers=auth_header)
+        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        if response.status_code == 200:
+            print("API key is valid.")
+            return True
+    except requests.exceptions.RequestException as e:
+        print(f"Error testing API key: {e}")
+    print("API key is invalid.")
+    return False
 
-# Get all games and for each game, check if it already has a cover
-def GetGamesList(co):
-    c = co.execute('SELECT slug FROM games')
-    games = c.fetchall()
-    for entry in games:
-        title = entry[0]
-        if not os.path.isfile(covpath + title + '.jpg'):
-            # If not, download it
-            DownloadCover(title)
+def connect_to_db(db_path):
+    """
+    Connects to the Lutris SQLite database.
+
+    Args:
+        db_path (str): Path to the Lutris database file (pga.db).
+
+    Returns:
+        sqlite3.Connection: Database connection object if successful, None otherwise.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        return conn
+    except sqlite3.Error as e:
+        print(f"Error: Could not connect to Lutris database '{db_path}'.")
+        print(f"       Details: {e}")
+        print("       Please ensure the path is correct or manually edit the script's path if necessary.")
+        return None
+
+def search_game_id(game_name, auth_header):
+    """
+    Searches for a game ID on SteamGridDB using the game name.
+
+    Args:
+        game_name (str): The name of the game to search for.
+        auth_header (dict): Authorization header dictionary.
+
+    Returns:
+        int: The game ID if found, None otherwise.
+    """
+    search_url = f'{STEAMGRIDDB_API_BASE_URL}/search/autocomplete/{game_name}'
+    try:
+        response = requests.get(search_url, headers=auth_header)
+        response.raise_for_status()
+        data = response.json().get("data")
+        if data and len(data) > 0:
+            print(f"Found game: {game_name.replace('-', ' ').title()}")
+            return data[0]["id"]
         else:
-            print("Cover for " + title.replace('-', ' ').title() + " already exists")
-    print('All done ! Restart Lutris for the changes to take effect')
+            print(f"Warning: Could not find a cover for game '{game_name}' on SteamGridDB.")
+            return None
+    except requests.exceptions.RequestException as e:
+        print(f"Error searching for game '{game_name}': {e}")
+        return None
+
+def download_cover(game_name, game_id, dimensions, cache_path, auth_header):
+    """
+    Downloads the cover art for a game from SteamGridDB.
+
+    Args:
+        game_name (str): The slug name of the game (from Lutris DB).
+        game_id (int): The SteamGridDB game ID.
+        dimensions (str): The desired dimensions of the cover art (e.g., '460x215').
+        cache_path (str): The local path to save the cover art.
+        auth_header (dict): Authorization header dictionary.
+    """
+    if not game_id:
+        return
+
+    print(f"Downloading cover for {game_name.replace('-', ' ').title()}...")
+    grids_url = f'{STEAMGRIDDB_API_BASE_URL}/grids/game/{game_id}?dimensions={dimensions}'
+    try:
+        response = requests.get(grids_url, headers=auth_header)
+        response.raise_for_status()
+        grids_data = response.json().get("data")
+
+        if grids_data and len(grids_data) > 0:
+            cover_url = grids_data[0]["url"]
+            cover_response = requests.get(cover_url, stream=True) # Use stream=True for efficient downloading
+            cover_response.raise_for_status()
+
+            filepath = os.path.join(cache_path, f'{game_name}.jpg')
+
+            # **CREATE DIRECTORY IF IT DOESN'T EXIST:**
+            os.makedirs(cache_path, exist_ok=True)
+
+            with open(filepath, 'wb') as f:
+                for chunk in cover_response.iter_content(chunk_size=8192): # Download in chunks
+                    f.write(chunk)
+            print(f"Cover saved to: {filepath}")
+        else:
+            print(f"Warning: Could not find a cover with dimensions '{dimensions}' for game '{game_name}' on SteamGridDB.")
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading cover for '{game_name}': {e}")
+
+
+def get_games_list_from_db(db_conn, cache_path, dimensions, auth_header):
+    """
+    Retrieves the list of games from the Lutris database and downloads covers if they are missing.
+
+    Args:
+        db_conn (sqlite3.Connection): Database connection object.
+        cache_path (str): The local path to save the cover art.
+        dimensions (str): The desired dimensions of the cover art.
+        auth_header (dict): Authorization header dictionary.
+    """
+    cursor = db_conn.cursor()
+    cursor.execute('SELECT slug FROM games')
+    games = cursor.fetchall()
+
+    if not games:
+        print("No games found in Lutris database.")
+        return
+
+    print("Checking and downloading covers...")
+    for entry in games:
+        game_slug = entry[0]
+        cover_exists = False # Flag to track if a cover already exists
+
+        for ext in COVER_ART_EXTENSIONS: # Iterate through extensions
+            cover_filepath = os.path.join(cache_path, f'{game_slug}{ext}')
+            if os.path.isfile(cover_filepath):
+                cover_exists = True
+                break # If one extension exists, no need to check others
+
+        if not cover_exists:
+            game_id = search_game_id(game_slug, auth_header)
+            download_cover(game_slug, game_id, dimensions, cache_path, auth_header)
+        else:
+            print(f"Cover for '{game_slug.replace('-', ' ').title()}' already exists.")
+
+    print('\nAll done! Restart Lutris for the changes to take effect.')
+
+
+def main():
+    """
+    Main function to run the Lutris Cover Art Downloader script.
+    """
+    global username # Still using global here for initial username retrieval, can be passed around if preferred
+    username = get_username()
+    if not username:
+        exit(1)
+    print(f"Welcome {username} to Lutris Cover Art Downloader!\n")
+
+    dimensions, cover_cache_path = get_cover_type()
+    if not dimensions or not cover_cache_path: # Exit if user cancelled or error in cover type selection
+        exit(0)
+
+    lutris_db_path = LUTRIS_DB_PATH_TEMPLATE.format(user=username)
+    db_conn = connect_to_db(lutris_db_path)
+    if not db_conn:
+        exit(1)
+
+    print("Getting API Key...\n")
+    auth_header = get_api_key_from_file()
+    if not auth_header:
+        auth_header = set_api_key()
+        if not auth_header: # Exit if API key setup failed
+            exit(1)
+
+    get_games_list_from_db(db_conn, cover_cache_path, dimensions, auth_header)
+
+    db_conn.close()
+
 
 if __name__ == '__main__':
     main()
